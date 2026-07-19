@@ -1,0 +1,20 @@
+{
+  "name": "simply360-reference-file-provider",
+  "version": "0.0.0",
+  "private": false,
+  "license": "Apache-2.0",
+  "description": "Public reference proof: a MinIO-backed, out-of-process gateway implementing the signed Simply360 primary-file-provider protocol. Synthetic proof objects only.",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "type-check": "tsc --noEmit",
+    "build": "tsc",
+    "test": "npm run build && node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "typescript": "~5.7.2"
+  }
+}

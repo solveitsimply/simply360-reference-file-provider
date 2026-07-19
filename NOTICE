@@ -1,0 +1,15 @@
+Simply360 Reference App — File Provider Gateway (simply360-reference-file-provider)
+Copyright 2026 Solve It Simply, Inc.
+
+This product includes software developed at Solve It Simply, Inc.
+(https://www.simply360.app).
+
+This repository is a public reference proof: a separately packaged,
+MinIO-backed gateway that implements the signed public primary-file-provider
+protocol out of process. It uses only public Simply360 platform boundaries and
+operates exclusively on disposable synthetic proof objects — never customer
+data. It contains no Simply360 internal database models, worker imports,
+provider secrets, or authorization logic.
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file for the
+full license text.
