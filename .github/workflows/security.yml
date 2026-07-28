@@ -1,7 +1,5 @@
-# Supply-chain security skeleton: dependency review on PRs, plus SBOM and
-# build provenance on pushes to `dev`. All third-party actions are pinned to a
-# full commit SHA (Ratified Direction 21: pinned workflow actions). Activates
-# when GitHub Actions billing is restored account-wide.
+# Required dependency review on PRs plus SBOM/provenance on protected `dev`.
+# Every third-party action is pinned to a full commit SHA.
 name: security
 
 on:
@@ -15,6 +13,7 @@ permissions:
 
 jobs:
   dependency-review:
+    name: security
     # PR-only: fails the PR if a newly introduced dependency has a known
     # vulnerability or a disallowed license.
     if: github.event_name == 'pull_request'
@@ -49,8 +48,8 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install (dev tooling only)
-        run: npm install --no-audit --no-fund
+      - name: Install
+        run: npm ci --no-audit --no-fund
 
       - name: Build
         run: npm run build

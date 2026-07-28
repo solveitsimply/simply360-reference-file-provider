@@ -1,7 +1,4 @@
-# CI skeleton: build + test. Activates automatically when GitHub Actions
-# billing is restored account-wide (currently billing-blocked, so no run has
-# executed yet). No status check is required on `dev` branch protection until
-# this workflow has a green baseline.
+# Required build, type-check, and test gate for protected `dev`.
 name: ci
 
 on:
@@ -19,6 +16,7 @@ concurrency:
 
 jobs:
   build-test:
+    name: ci
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -29,8 +27,8 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install (dev tooling only)
-        run: npm install --no-audit --no-fund
+      - name: Install
+        run: npm ci --no-audit --no-fund
 
       - name: Type-check
         run: npm run type-check
