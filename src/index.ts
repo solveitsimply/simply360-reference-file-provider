@@ -482,11 +482,34 @@ interface MutableGatewayState {
   readonly changes: Change[];
   readonly migrations: MigrationState[];
   readonly committedPuts: [string, string][];
+  readonly archivedObjects: [string, string][];
+  readonly protectedMigrationSources: string[];
+}
+
+interface StorageMutationSnapshot {
+  readonly objectId: string;
+  readonly object: StoredObject | null;
+}
+
+interface StorageRollbackFence {
+  readonly schemaVersion: "simply360.reference-file-provider-rollback/v1";
+  readonly priorSequence: number;
+  readonly objectId: string;
+  readonly original: {
+    readonly bodyBase64Url: string;
+    readonly sizeBytes: number;
+    readonly contentSha256: string;
+    readonly immutableProviderVersion: string;
+  } | null;
 }
 
 const MAXIMUM_REQUEST_BYTES = 8 * 1024 * 1024;
 const CONTROL_STATE_OBJECT_ID = "proof.gateway-control-v1";
+const STORAGE_ROLLBACK_FENCE_OBJECT_ID = "proof.gateway-rollback-fence-v1";
 const MAXIMUM_OUTBOX_CHANGES = 1_000;
+const MAXIMUM_TRACKED_OBJECTS = 1_000;
+const MAXIMUM_TRACKED_MIGRATIONS = 100;
+const MAXIMUM_USAGE_OBJECTS = 10_000;
 
 export class PrimaryFileProviderGateway {
   private containment: ContainmentState = "NONE";
@@ -496,7 +519,13 @@ export class PrimaryFileProviderGateway {
   private readonly changes: Change[] = [];
   private readonly migrations = new Map<string, MigrationState>();
   private readonly committedPuts = new Map<string, string>();
+  private readonly archivedObjects = new Map<string, string>();
+  private readonly protectedMigrationSources = new Set<string>();
   private initialization?: Promise<void>;
+  private storageRecoveryRequired = false;
+  private recoveryContainment: ContainmentState | null = null;
+  private ambiguousPriorState: MutableGatewayState | null = null;
+  private ambiguousIntendedStateBody: Uint8Array | null = null;
   private serializedRequests: Promise<void> = Promise.resolve();
   private readonly platformKey;
   private readonly providerKey;
@@ -517,17 +546,47 @@ export class PrimaryFileProviderGateway {
     try {
       return await this.serialize(async () => {
         await this.initialize();
+        if (this.ambiguousPriorState) await this.resolveAmbiguousControlState();
+        if (this.storageRecoveryRequired) await this.recoverStorageFence();
         this.assertEnvelopeFresh(envelope);
         const isMutating = this.isMutatingOperation(envelope.operation);
         const snapshot = isMutating ? this.snapshotState() : null;
+        const storageSnapshot = isMutating
+          ? await this.snapshotStorageMutation(envelope, request.body)
+          : null;
+        if (storageSnapshot)
+          await this.prepareStorageFence(storageSnapshot, this.sequence);
+        let response: GatewayResponse;
         try {
-          const response = await this.dispatch(envelope, request.body);
-          if (isMutating) await this.persistState();
-          return response;
+          response = await this.dispatch(envelope, request.body);
         } catch (error) {
-          if (snapshot) this.restoreState(snapshot);
+          if (snapshot) await this.rollbackMutation(snapshot, storageSnapshot);
           throw error;
         }
+        if (isMutating) {
+          try {
+            await this.persistState();
+          } catch (error) {
+            try {
+              if (await this.currentStateIsDurable()) {
+                await this.finishStorageFence(storageSnapshot);
+                return response;
+              }
+            } catch {
+              if (!snapshot)
+                throw new ProviderError(500, "MUTATION_SNAPSHOT_MISSING");
+              this.ambiguousPriorState = snapshot;
+              this.ambiguousIntendedStateBody = this.stateBody();
+              this.storageRecoveryRequired = storageSnapshot !== null;
+              throw new ProviderError(503, "CONTROL_STATE_COMMIT_UNKNOWN");
+            }
+            if (snapshot)
+              await this.rollbackMutation(snapshot, storageSnapshot);
+            throw error;
+          }
+        }
+        await this.finishStorageFence(storageSnapshot);
+        return response;
       });
     } catch (error) {
       const statusCode =
@@ -682,9 +741,22 @@ export class PrimaryFileProviderGateway {
       );
     }
     if (envelope.operation === "USAGE_GET") {
-      const ids = (await this.config.objectStore.list(null, 100)).filter(
-        (id) => id !== this.controlStateObjectId,
-      );
+      const ids: string[] = [];
+      let afterObjectId: string | null = null;
+      while (true) {
+        const page = await this.config.objectStore.list(afterObjectId, 100);
+        if (page.length === 0) break;
+        for (const objectId of page) {
+          if (!this.isInternalObjectId(objectId)) ids.push(objectId);
+          if (ids.length > MAXIMUM_USAGE_OBJECTS)
+            throw new ProviderError(503, "USAGE_LIMIT_EXCEEDED");
+        }
+        const nextObjectId = page.at(-1)!;
+        if (nextObjectId === afterObjectId)
+          throw new ProviderError(500, "OBJECT_STORE_PAGINATION_STALLED");
+        afterObjectId = nextObjectId;
+        if (page.length < 100) break;
+      }
       let sizeBytes = 0;
       for (const objectId of ids)
         sizeBytes += (await this.config.objectStore.head(objectId)).sizeBytes;
@@ -707,12 +779,26 @@ export class PrimaryFileProviderGateway {
         afterProviderObjectId: string | null;
         limit: number;
       };
-      const objectIds = (
-        await this.config.objectStore.list(
-          inventoryBody.afterProviderObjectId,
-          inventoryBody.limit,
-        )
-      ).filter((id) => id !== this.controlStateObjectId);
+      const objectIds: string[] = [];
+      let scanAfterObjectId = inventoryBody.afterProviderObjectId;
+      while (objectIds.length < inventoryBody.limit) {
+        const pageStartAfterObjectId = scanAfterObjectId;
+        const page = await this.config.objectStore.list(
+          scanAfterObjectId,
+          100,
+        );
+        if (page.length === 0) break;
+        for (const objectId of page) {
+          scanAfterObjectId = objectId;
+          if (!this.isInternalObjectId(objectId)) objectIds.push(objectId);
+          if (objectIds.length === inventoryBody.limit) break;
+        }
+        if (objectIds.length === inventoryBody.limit) break;
+        const nextObjectId = page.at(-1)!;
+        if (nextObjectId === pageStartAfterObjectId)
+          throw new ProviderError(500, "OBJECT_STORE_PAGINATION_STALLED");
+        if (page.length < 100) break;
+      }
       return this.respond(envelope, 200, { objectIds }, null);
     }
     if (envelope.operation === "RECONCILE") {
@@ -728,20 +814,36 @@ export class PrimaryFileProviderGateway {
       );
       return this.respond(envelope, 200, { objects }, null);
     }
-    if (envelope.operation === "MIGRATION_SOAK")
-      return this.respond(
-        envelope,
-        200,
-        {
-          migrations: [...this.migrations.values()].filter(
-            (migration) =>
-              migration.soakUntil &&
-              Date.parse(migration.soakUntil) <=
-                (this.config.now ?? (() => new Date()))().getTime(),
-          ),
-        },
-        null,
+    if (envelope.operation === "MIGRATION_SOAK") {
+      const completed = [...this.migrations.values()].filter(
+        (migration) =>
+          migration.soakUntil &&
+          Date.parse(migration.soakUntil) <=
+            (this.config.now ?? (() => new Date()))().getTime(),
       );
+      if (this.changes.length + completed.length > MAXIMUM_OUTBOX_CHANGES)
+        throw new ProviderError(503, "OUTBOX_BACKPRESSURE");
+      const newProtectedSources = new Set(
+        completed
+          .map((migration) => migration.source)
+          .filter((source) => !this.protectedMigrationSources.has(source)),
+      );
+      if (
+        this.protectedMigrationSources.size + newProtectedSources.size >
+        MAXIMUM_TRACKED_OBJECTS
+      )
+        throw new ProviderError(503, "MIGRATION_SOURCE_STATE_BACKPRESSURE");
+      for (const migration of completed) {
+        this.protectedMigrationSources.add(migration.source);
+        this.migrations.delete(migration.target);
+        this.record(
+          "MIGRATION_SOAK_COMPLETED",
+          migration.target,
+          migration.version,
+        );
+      }
+      return this.respond(envelope, 200, { migrations: completed }, null);
+    }
     if (
       !id &&
       !["MIGRATION_COPY", "MIGRATION_VERIFY", "MIGRATION_SWITCH"].includes(
@@ -759,25 +861,39 @@ export class PrimaryFileProviderGateway {
         return this.metadata(envelope, id!, false);
       case "OBJECT_CHECKSUM":
         return this.metadata(envelope, id!, true);
-      case "OBJECT_ARCHIVE":
+      case "OBJECT_ARCHIVE": {
+        const value = await this.requireImmutableVersion(envelope, id!);
+        if (this.archivedObjects.get(id!) === value.immutableProviderVersion)
+          return this.respond(envelope, 200, { archived: true }, value);
+        if (
+          !this.archivedObjects.has(id!) &&
+          this.archivedObjects.size >= MAXIMUM_TRACKED_OBJECTS
+        )
+          throw new ProviderError(503, "ARCHIVE_STATE_BACKPRESSURE");
         this.ensureOutboxCapacity();
-        this.record("ARCHIVED", id!, envelope.immutableProviderVersion);
-        return this.respond(envelope, 200, { archived: true }, null);
-      case "OBJECT_RESTORE":
+        this.archivedObjects.set(id!, value.immutableProviderVersion);
+        this.record("ARCHIVED", id!, value.immutableProviderVersion);
+        return this.respond(envelope, 200, { archived: true }, value);
+      }
+      case "OBJECT_RESTORE": {
+        const value = await this.requireImmutableVersion(envelope, id!);
+        if (this.archivedObjects.get(id!) !== value.immutableProviderVersion)
+          throw new ProviderError(409, "OBJECT_NOT_ARCHIVED");
         this.ensureOutboxCapacity();
-        this.record("RESTORED", id!, envelope.immutableProviderVersion);
-        return this.respond(envelope, 200, { restored: true }, null);
+        this.archivedObjects.delete(id!);
+        this.record("RESTORED", id!, value.immutableProviderVersion);
+        return this.respond(envelope, 200, { restored: true }, value);
+      }
       case "OBJECT_DELETE":
         if (this.containment !== "NONE")
           throw new ProviderError(423, "DELETE_CONTAINED");
         await this.requireImmutableVersion(envelope, id!);
-        if (
-          id === this.controlStateObjectId ||
-          this.isProtectedMigrationObject(id!)
-        )
+        if (this.isProtectedMigrationObject(id!))
           throw new ProviderError(409, "MIGRATION_DELETE_FORBIDDEN");
         this.ensureOutboxCapacity();
         await this.config.objectStore.delete(id!);
+        this.committedPuts.delete(id!);
+        this.archivedObjects.delete(id!);
         this.record("DELETED", id!, envelope.immutableProviderVersion);
         return this.respond(envelope, 204, undefined, null);
       case "MIGRATION_COPY":
@@ -807,12 +923,14 @@ export class PrimaryFileProviderGateway {
       )
         throw new ProviderError(409, "OBJECT_VERSION_CONFLICT");
       if (this.committedPuts.get(id) !== existing.immutableProviderVersion) {
+        this.ensureTrackedObjectCapacity(id);
         this.ensureOutboxCapacity();
         this.record("PUT", id, existing.immutableProviderVersion);
         this.committedPuts.set(id, existing.immutableProviderVersion);
       }
       return this.respond(envelope, 200, { providerObjectId: id }, existing);
     }
+    this.ensureTrackedObjectCapacity(id);
     this.ensureOutboxCapacity();
     const value = await this.config.objectStore.put(id, body);
     if (this.failureMode === "AFTER_OBJECT_WRITE_BEFORE_COMMIT")
@@ -864,6 +982,8 @@ export class PrimaryFileProviderGateway {
       throw new ProviderError(400, "MIGRATION_IDS_MUST_DIFFER");
     if (this.migrations.has(target) || (await this.findObject(target)))
       throw new ProviderError(409, "MIGRATION_TARGET_EXISTS");
+    if (this.migrations.size >= MAXIMUM_TRACKED_MIGRATIONS)
+      throw new ProviderError(503, "MIGRATION_STATE_BACKPRESSURE");
     this.ensureOutboxCapacity();
     const sourceObject = await this.config.objectStore.head(source);
     if (
@@ -985,6 +1105,7 @@ export class PrimaryFileProviderGateway {
     }
   }
   private isProtectedMigrationObject(objectId: string): boolean {
+    if (this.protectedMigrationSources.has(objectId)) return true;
     const now = (this.config.now ?? (() => new Date()))().getTime();
     return [...this.migrations.values()].some((migration) => {
       if (migration.source === objectId) return true;
@@ -1022,6 +1143,13 @@ export class PrimaryFileProviderGateway {
     if (this.changes.length >= MAXIMUM_OUTBOX_CHANGES)
       throw new ProviderError(503, "OUTBOX_BACKPRESSURE");
   }
+  private ensureTrackedObjectCapacity(objectId: string): void {
+    if (
+      !this.committedPuts.has(objectId) &&
+      this.committedPuts.size >= MAXIMUM_TRACKED_OBJECTS
+    )
+      throw new ProviderError(503, "OBJECT_STATE_BACKPRESSURE");
+  }
   private async exists(objectId: string): Promise<boolean> {
     try {
       await this.config.objectStore.head(objectId);
@@ -1034,7 +1162,7 @@ export class PrimaryFileProviderGateway {
   }
   private assertDataObjectId(objectId: string): void {
     assertProofObjectId(objectId);
-    if (objectId === this.controlStateObjectId)
+    if (this.isInternalObjectId(objectId))
       throw new ProviderError(403, "CONTROL_STATE_OBJECT_RESERVED");
   }
   private async initialize(): Promise<void> {
@@ -1065,7 +1193,6 @@ export class PrimaryFileProviderGateway {
       "USAGE_GET",
       "CHANGES_LIST",
       "RECONCILE",
-      "MIGRATION_SOAK",
     ].includes(operation);
   }
   private async loadState(): Promise<void> {
@@ -1100,7 +1227,14 @@ export class PrimaryFileProviderGateway {
         ) ||
         !Array.isArray(control.changes) ||
         !Array.isArray(control.migrations) ||
-        !Array.isArray(control.committedPuts)
+        !Array.isArray(control.committedPuts) ||
+        !Array.isArray(control.archivedObjects) ||
+        !Array.isArray(control.protectedMigrationSources) ||
+        control.changes.length > MAXIMUM_OUTBOX_CHANGES ||
+        control.migrations.length > MAXIMUM_TRACKED_MIGRATIONS ||
+        control.committedPuts.length > MAXIMUM_TRACKED_OBJECTS ||
+        control.archivedObjects.length > MAXIMUM_TRACKED_OBJECTS ||
+        control.protectedMigrationSources.length > MAXIMUM_TRACKED_OBJECTS
       )
         throw new Error("Invalid control state");
       this.containment = control.containment as ContainmentState;
@@ -1130,27 +1264,105 @@ export class PrimaryFileProviderGateway {
           throw new Error("Invalid committed PUT control state");
         this.committedPuts.set(entry[0], entry[1]);
       }
+      for (const entry of control.archivedObjects as unknown[]) {
+        if (
+          !Array.isArray(entry) ||
+          entry.length !== 2 ||
+          typeof entry[0] !== "string" ||
+          typeof entry[1] !== "string" ||
+          !/^sha256:[a-f0-9]{64}$/.test(entry[1])
+        )
+          throw new Error("Invalid archived-object control state");
+        this.archivedObjects.set(entry[0], entry[1]);
+      }
+      for (const source of control.protectedMigrationSources as unknown[]) {
+        if (typeof source !== "string")
+          throw new Error("Invalid protected migration source control state");
+        this.assertDataObjectId(source);
+        this.protectedMigrationSources.add(source);
+      }
     } catch (error) {
-      if (error instanceof ProviderError && error.statusCode === 404) return;
+      if (!(error instanceof ProviderError && error.statusCode === 404))
+        throw error;
+    }
+    await this.recoverStorageFence();
+  }
+  private async persistState(): Promise<void> {
+    await this.config.objectStore.put(
+      this.controlStateObjectId,
+      this.stateBody(),
+    );
+  }
+  private stateBody(
+    state: MutableGatewayState = this.snapshotState(),
+  ): Uint8Array {
+    return Buffer.from(
+      canonicalize({
+        containment: state.containment,
+        failureMode: state.failureMode,
+        sequence: state.sequence,
+        acknowledgedThroughSequence: state.acknowledgedThroughSequence,
+        changes: state.changes,
+        migrations: state.migrations,
+        committedPuts: state.committedPuts,
+        archivedObjects: state.archivedObjects,
+        protectedMigrationSources: state.protectedMigrationSources,
+      }),
+    );
+  }
+  private async currentStateIsDurable(): Promise<boolean> {
+    try {
+      const stored = await this.config.objectStore.get(
+        this.controlStateObjectId,
+      );
+      return Buffer.from(stored.body).equals(Buffer.from(this.stateBody()));
+    } catch (error) {
+      if (error instanceof ProviderError && error.statusCode === 404)
+        return false;
       throw error;
     }
   }
-  private async persistState(): Promise<void> {
-    const body = Buffer.from(
-      canonicalize({
-        containment: this.containment,
-        failureMode: this.failureMode,
-        sequence: this.sequence,
-        acknowledgedThroughSequence: this.acknowledgedThroughSequence,
-        changes: this.changes,
-        migrations: [...this.migrations.values()],
-        committedPuts: [...this.committedPuts.entries()],
-      }),
-    );
-    await this.config.objectStore.put(this.controlStateObjectId, body);
+  private async resolveAmbiguousControlState(): Promise<void> {
+    const prior = this.ambiguousPriorState;
+    const intended = this.ambiguousIntendedStateBody;
+    if (!prior || !intended)
+      throw new Error(
+        "Ambiguous control state is missing its comparison snapshots",
+      );
+    let stored: Uint8Array | null = null;
+    try {
+      stored = (await this.config.objectStore.get(this.controlStateObjectId))
+        .body;
+    } catch (error) {
+      if (!(error instanceof ProviderError && error.statusCode === 404))
+        throw error;
+    }
+    if (stored && Buffer.from(stored).equals(Buffer.from(intended))) {
+      // The state commit succeeded and only its response was lost.
+    } else if (
+      stored === null ||
+      Buffer.from(stored).equals(Buffer.from(this.stateBody(prior)))
+    ) {
+      this.restoreState(prior);
+    } else {
+      throw new Error(
+        "Durable control state matches neither side of the pending commit",
+      );
+    }
+    this.ambiguousPriorState = null;
+    this.ambiguousIntendedStateBody = null;
   }
   private get controlStateObjectId(): string {
     return this.config.controlStateObjectId ?? CONTROL_STATE_OBJECT_ID;
+  }
+  private get storageRollbackFenceObjectId(): string {
+    return STORAGE_ROLLBACK_FENCE_OBJECT_ID;
+  }
+  private isInternalObjectId(objectId: string): boolean {
+    return (
+      objectId === this.controlStateObjectId ||
+      objectId === this.storageRollbackFenceObjectId
+    );
   }
   private assertEnvelopeFresh(envelope: RequestEnvelope): void {
     const now = (this.config.now ?? (() => new Date()))().getTime();
@@ -1167,22 +1379,229 @@ export class PrimaryFileProviderGateway {
       sequence: this.sequence,
       acknowledgedThroughSequence: this.acknowledgedThroughSequence,
       changes: this.changes.map((change) => ({ ...change })),
-      migrations: [...this.migrations.values()].map((migration) => ({ ...migration })),
+      migrations: [...this.migrations.values()].map((migration) => ({
+        ...migration,
+      })),
       committedPuts: [...this.committedPuts.entries()],
+      archivedObjects: [...this.archivedObjects.entries()],
+      protectedMigrationSources: [...this.protectedMigrationSources],
     };
+  }
+  private async snapshotStorageMutation(
+    envelope: RequestEnvelope,
+    body: Uint8Array,
+  ): Promise<StorageMutationSnapshot | null> {
+    let objectId: string | null = null;
+    if (
+      envelope.operation === "OBJECT_PUT" ||
+      envelope.operation === "OBJECT_DELETE"
+    ) {
+      objectId = envelope.providerObjectId;
+    } else if (envelope.operation === "MIGRATION_COPY") {
+      const operationBody = parseOperationBody(envelope.operation, body);
+      objectId = asProofId(operationBody.targetProviderObjectId);
+    }
+    if (!objectId) return null;
+    this.assertDataObjectId(objectId);
+    return {
+      objectId,
+      object: await this.findFullObject(objectId),
+    };
+  }
+  private async rollbackMutation(
+    snapshot: MutableGatewayState,
+    storageSnapshot: StorageMutationSnapshot | null,
+  ): Promise<void> {
+    try {
+      if (storageSnapshot) await this.restoreStorageMutation(storageSnapshot);
+      this.restoreState(snapshot);
+      await this.finishStorageFence(storageSnapshot);
+    } catch {
+      this.restoreState(snapshot);
+      this.recoveryContainment = snapshot.containment;
+      this.containment = "FULL_DISABLE_OR_QUARANTINE";
+      this.storageRecoveryRequired = storageSnapshot !== null;
+      throw new ProviderError(500, "STORAGE_ROLLBACK_FAILED");
+    }
+  }
+  private async finishStorageFence(
+    snapshot: StorageMutationSnapshot | null,
+  ): Promise<void> {
+    if (!snapshot) return;
+    try {
+      await this.clearStorageFence();
+    } catch {
+      this.storageRecoveryRequired = true;
+    }
+  }
+  private async prepareStorageFence(
+    snapshot: StorageMutationSnapshot,
+    priorSequence: number,
+  ): Promise<void> {
+    const fence: StorageRollbackFence = {
+      schemaVersion: "simply360.reference-file-provider-rollback/v1",
+      priorSequence,
+      objectId: snapshot.objectId,
+      original: snapshot.object
+        ? {
+            bodyBase64Url: Buffer.from(snapshot.object.body).toString(
+              "base64url",
+            ),
+            sizeBytes: snapshot.object.sizeBytes,
+            contentSha256: snapshot.object.contentSha256,
+            immutableProviderVersion: snapshot.object.immutableProviderVersion,
+          }
+        : null,
+    };
+    await this.config.objectStore.put(
+      this.storageRollbackFenceObjectId,
+      Buffer.from(canonicalize(fence)),
+    );
+  }
+  private async clearStorageFence(): Promise<void> {
+    await this.config.objectStore.delete(this.storageRollbackFenceObjectId);
+    this.storageRecoveryRequired = false;
+  }
+  private async recoverStorageFence(): Promise<void> {
+    let stored: StoredObject;
+    try {
+      stored = await this.config.objectStore.get(
+        this.storageRollbackFenceObjectId,
+      );
+    } catch (error) {
+      if (error instanceof ProviderError && error.statusCode === 404) {
+        this.storageRecoveryRequired = false;
+        return;
+      }
+      throw error;
+    }
+    const value = parseStrictJson(
+      new TextDecoder("utf-8", { fatal: true }).decode(stored.body),
+    );
+    if (!value || Array.isArray(value) || typeof value !== "object")
+      throw new Error("Invalid storage rollback fence");
+    const fence = value as Record<string, unknown>;
+    if (
+      Object.keys(fence).sort().join(",") !==
+        "objectId,original,priorSequence,schemaVersion" ||
+      fence.schemaVersion !== "simply360.reference-file-provider-rollback/v1" ||
+      !positiveBoundedInteger(
+        fence.priorSequence,
+        0,
+        Number.MAX_SAFE_INTEGER,
+      ) ||
+      typeof fence.objectId !== "string"
+    )
+      throw new Error("Invalid storage rollback fence");
+    this.assertDataObjectId(fence.objectId);
+    let original: StoredObject | null = null;
+    if (fence.original !== null) {
+      if (
+        !fence.original ||
+        Array.isArray(fence.original) ||
+        typeof fence.original !== "object"
+      )
+        throw new Error("Invalid storage rollback fence object");
+      const originalValue = fence.original as Record<string, unknown>;
+      if (
+        Object.keys(originalValue).sort().join(",") !==
+          "bodyBase64Url,contentSha256,immutableProviderVersion,sizeBytes" ||
+        typeof originalValue.bodyBase64Url !== "string" ||
+        originalValue.bodyBase64Url.length >
+          Math.ceil((MAXIMUM_REQUEST_BYTES * 4) / 3) + 4 ||
+        !/^[A-Za-z0-9_-]*$/.test(originalValue.bodyBase64Url) ||
+        !positiveBoundedInteger(
+          originalValue.sizeBytes,
+          0,
+          MAXIMUM_REQUEST_BYTES,
+        ) ||
+        typeof originalValue.contentSha256 !== "string" ||
+        !/^[a-f0-9]{64}$/.test(originalValue.contentSha256) ||
+        originalValue.immutableProviderVersion !==
+          `sha256:${originalValue.contentSha256}`
+      )
+        throw new Error("Invalid storage rollback fence object");
+      const body = Buffer.from(originalValue.bodyBase64Url, "base64url");
+      if (
+        body.toString("base64url") !== originalValue.bodyBase64Url ||
+        body.length !== originalValue.sizeBytes ||
+        sha256(body) !== originalValue.contentSha256
+      )
+        throw new Error("Invalid storage rollback fence body");
+      original = objectFor(body);
+    }
+    if (this.sequence < fence.priorSequence)
+      throw new Error("Storage rollback fence sequence is ahead of state");
+    if (this.sequence === fence.priorSequence)
+      await this.restoreStorageMutation({
+        objectId: fence.objectId,
+        object: original,
+      });
+    await this.clearStorageFence();
+    if (this.recoveryContainment !== null) {
+      this.containment = this.recoveryContainment;
+      this.recoveryContainment = null;
+    }
+  }
+  private async findFullObject(objectId: string): Promise<StoredObject | null> {
+    try {
+      const object = await this.config.objectStore.get(objectId);
+      return { ...object, body: new Uint8Array(object.body) };
+    } catch (error) {
+      if (error instanceof ProviderError && error.statusCode === 404)
+        return null;
+      throw error;
+    }
+  }
+  private async restoreStorageMutation(
+    snapshot: StorageMutationSnapshot,
+  ): Promise<void> {
+    const current = await this.findObject(snapshot.objectId);
+    if (!snapshot.object) {
+      if (current) await this.config.objectStore.delete(snapshot.objectId);
+      return;
+    }
+    if (
+      current?.immutableProviderVersion ===
+        snapshot.object.immutableProviderVersion &&
+      current.contentSha256 === snapshot.object.contentSha256 &&
+      current.sizeBytes === snapshot.object.sizeBytes
+    )
+      return;
+    const restored = await this.config.objectStore.put(
+      snapshot.objectId,
+      snapshot.object.body,
+    );
+    if (
+      restored.immutableProviderVersion !==
+        snapshot.object.immutableProviderVersion ||
+      restored.contentSha256 !== snapshot.object.contentSha256 ||
+      restored.sizeBytes !== snapshot.object.sizeBytes
+    )
+      throw new ProviderError(500, "STORAGE_ROLLBACK_VERSION_MISMATCH");
   }
   private restoreState(snapshot: MutableGatewayState): void {
     this.containment = snapshot.containment;
     this.failureMode = snapshot.failureMode;
     this.sequence = snapshot.sequence;
     this.acknowledgedThroughSequence = snapshot.acknowledgedThroughSequence;
-    this.changes.splice(0, this.changes.length, ...snapshot.changes.map((change) => ({ ...change })));
+    this.changes.splice(
+      0,
+      this.changes.length,
+      ...snapshot.changes.map((change) => ({ ...change })),
+    );
     this.migrations.clear();
     for (const migration of snapshot.migrations)
       this.migrations.set(migration.target, { ...migration });
     this.committedPuts.clear();
     for (const [objectId, version] of snapshot.committedPuts)
       this.committedPuts.set(objectId, version);
+    this.archivedObjects.clear();
+    for (const [objectId, version] of snapshot.archivedObjects)
+      this.archivedObjects.set(objectId, version);
+    this.protectedMigrationSources.clear();
+    for (const objectId of snapshot.protectedMigrationSources)
+      this.protectedMigrationSources.add(objectId);
   }
   private respond(
     envelope: RequestEnvelope,

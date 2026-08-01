@@ -54,9 +54,14 @@ runtime; synthetic-only storage.
 │   ├── dependabot.yml          # npm + github-actions weekly updates (dev branch)
 │   └── workflows/
 │       ├── ci.yml              # build + test (pinned action SHAs)
+│       ├── deploy-dev.yml      # manual, digest-only, idle-service dev deployment
 │       └── security.yml        # dependency-review + SBOM + build provenance
 ├── infra/
-│   └── README.md               # intended OIDC role + NonProd Fargate/MinIO topology (no AWS resources created)
+│   ├── reference-file-provider-dev-bootstrap.yaml # one-time exact-repo IAM roles
+│   ├── reference-file-provider-dev.yaml           # zero-idle bounded proof stack
+│   ├── run-acceptance-window.sh                    # one-task/four-hour acceptance guard
+│   └── README.md
+├── scripts/run-minio-proof.mjs # pinned-image live adapter proof
 ├── src/
 │   └── index.ts                # signed gateway, MinIO adapter, HTTP entry point
 ├── test/
@@ -113,6 +118,20 @@ failures. The test suite proves failure injection, `READ_ONLY` containment,
 explicit recovery, canonical golden vectors, and closed-schema rejection. A
 local Docker/MinIO verification additionally exercises SigV4 bucket creation,
 PUT/GET/HEAD/list/delete, and `:`, `=`, and `/` percent-encoded object names.
+
+Every byte-changing request writes a bounded rollback fence to the task-local
+MinIO sidecar before it touches object bytes. A failed control-state commit is
+compensated immediately; if that compensation also fails, the same live task
+returns an error but remains running, and its next request repairs the exact
+prior bytes from the fence before serving. The zero-idle proof stack uses
+ephemeral Fargate storage, so the fence is intentionally not claimed to survive
+an ECS task replacement; the whole synthetic proof store is disposable with
+that task. Archive/restore requires the exact live immutable version and
+persists logical archive state. The outbox, committed
+PUT set, archive set, active migrations, and permanently protected migration
+sources all have explicit caps; deletes and completed soak operations retire
+the state that is safe to retire. Usage reads paginate to completion rather
+than silently truncating the object inventory.
 
 ## CI / security posture
 

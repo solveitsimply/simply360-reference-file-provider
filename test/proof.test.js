@@ -27,7 +27,11 @@ const routes = {
   OBJECT_GET: ["GET", "/v1/primary-file-provider/objects/content"],
   OBJECT_HEAD: ["HEAD", "/v1/primary-file-provider/objects"],
   OBJECT_CHECKSUM: ["GET", "/v1/primary-file-provider/objects/checksum"],
+  OBJECT_ARCHIVE: ["POST", "/v1/primary-file-provider/objects/archive"],
+  OBJECT_RESTORE: ["POST", "/v1/primary-file-provider/objects/restore"],
   OBJECT_DELETE: ["DELETE", "/v1/primary-file-provider/objects"],
+  INVENTORY_LIST: ["POST", "/v1/primary-file-provider/inventory"],
+  USAGE_GET: ["GET", "/v1/primary-file-provider/usage"],
   MIGRATION_COPY: ["POST", "/v1/primary-file-provider/migration/copy"],
   MIGRATION_VERIFY: ["POST", "/v1/primary-file-provider/migration/verify"],
   MIGRATION_SWITCH: ["POST", "/v1/primary-file-provider/migration/switch"],
@@ -168,6 +172,7 @@ function fixture(objectStore = new MemoryObjectStore()) {
     operation,
     body = new Uint8Array(),
     overrides = {},
+    targetGateway = gateway,
   ) => {
     const [method, path] = routes[operation];
     const requestBody =
@@ -206,7 +211,7 @@ function fixture(objectStore = new MemoryObjectStore()) {
       Buffer.concat([Buffer.from(REQUEST_DOMAIN), envelopeBytes]),
       platform.privateKey,
     ).toString("base64url");
-    const result = await gateway.handle({
+    const result = await targetGateway.handle({
       method,
       path,
       headers: {
@@ -274,6 +279,32 @@ class FailingControlStateStore extends MemoryObjectStore {
       throw new Error("injected control-state persistence failure");
     }
     return super.put(objectId, body);
+  }
+}
+
+class FailingCompensationStore extends FailingControlStateStore {
+  failNextDataWriteFor = null;
+  async put(objectId, body) {
+    if (objectId === this.failNextDataWriteFor) {
+      this.failNextDataWriteFor = null;
+      throw new Error("injected data compensation failure");
+    }
+    return super.put(objectId, body);
+  }
+}
+
+class AmbiguousControlStateStore extends MemoryObjectStore {
+  storeThenThrowNextControlWrite = false;
+  async put(objectId, body) {
+    const stored = await super.put(objectId, body);
+    if (
+      objectId === "proof.gateway-control-v1" &&
+      this.storeThenThrowNextControlWrite
+    ) {
+      this.storeThenThrowNextControlWrite = false;
+      throw new Error("injected lost control-state PUT response");
+    }
+    return stored;
   }
 }
 
@@ -380,7 +411,10 @@ test("a failed control-state write rolls back containment before serving the nex
   const { request } = fixture(store);
   let call = await request(
     "LIFECYCLE",
-    JSON.stringify({ action: "SET_CONTAINMENT", containmentState: "READ_ONLY" }),
+    JSON.stringify({
+      action: "SET_CONTAINMENT",
+      containmentState: "READ_ONLY",
+    }),
   );
   assert.equal(call.result.statusCode, 200);
 
@@ -395,6 +429,202 @@ test("a failed control-state write rolls back containment before serving the nex
     providerObjectId: "proof.rollback-blocked",
   });
   assert.equal(call.result.statusCode, 423);
+});
+
+test("failed control-state persistence compensates delete and migration-copy bytes", async () => {
+  const store = new FailingControlStateStore();
+  const { request } = fixture(store);
+  const source = "proof.persist-source";
+  const target = "proof.persist-target";
+  const bytes = Buffer.from("must survive failed control persistence");
+  const version = `sha256:${digest(bytes)}`;
+  let call = await request("OBJECT_PUT", bytes, { providerObjectId: source });
+  assert.equal(call.result.statusCode, 201);
+
+  store.failNextControlWrite = true;
+  call = await request(
+    "OBJECT_DELETE",
+    JSON.stringify({ deletionMode: "PERMANENT", reason: "rollback proof" }),
+    { providerObjectId: source, immutableProviderVersion: version },
+  );
+  assert.equal(call.result.statusCode, 500);
+  call = await request("OBJECT_HEAD", undefined, {
+    providerObjectId: source,
+    immutableProviderVersion: version,
+  });
+  assert.equal(
+    call.result.statusCode,
+    200,
+    "failed delete restores the exact bytes",
+  );
+
+  store.failNextControlWrite = true;
+  call = await request(
+    "MIGRATION_COPY",
+    JSON.stringify({
+      sourceProviderObjectId: source,
+      sourceImmutableProviderVersion: version,
+      targetProviderObjectId: target,
+    }),
+  );
+  assert.equal(call.result.statusCode, 500);
+  call = await request("OBJECT_HEAD", undefined, {
+    providerObjectId: target,
+    immutableProviderVersion: version,
+  });
+  assert.equal(
+    call.result.statusCode,
+    404,
+    "failed copy removes its uncommitted target",
+  );
+  call = await request(
+    "MIGRATION_COPY",
+    JSON.stringify({
+      sourceProviderObjectId: source,
+      sourceImmutableProviderVersion: version,
+      targetProviderObjectId: target,
+    }),
+  );
+  assert.equal(call.result.statusCode, 201, "the exact copy remains retryable");
+});
+
+test("the live task repairs failed compensation before its next request", async () => {
+  const store = new FailingCompensationStore();
+  const { request } = fixture(store);
+  const objectId = "proof.durable-rollback";
+  const bytes = Buffer.from("recover on the live task");
+  const version = `sha256:${digest(bytes)}`;
+  let call = await request("OBJECT_PUT", bytes, { providerObjectId: objectId });
+  assert.equal(call.result.statusCode, 201);
+
+  store.failNextControlWrite = true;
+  store.failNextDataWriteFor = objectId;
+  call = await request(
+    "OBJECT_DELETE",
+    JSON.stringify({
+      deletionMode: "PERMANENT",
+      reason: "durable fence proof",
+    }),
+    { providerObjectId: objectId, immutableProviderVersion: version },
+  );
+  assert.equal(call.result.statusCode, 500);
+  assert.equal(JSON.parse(call.result.body).code, "STORAGE_ROLLBACK_FAILED");
+  await assert.rejects(() => store.head(objectId));
+
+  call = await request(
+    "OBJECT_HEAD",
+    undefined,
+    { providerObjectId: objectId, immutableProviderVersion: version },
+  );
+  assert.equal(call.result.statusCode, 200);
+  assert.deepEqual(Buffer.from((await store.get(objectId)).body), bytes);
+  await assert.rejects(() => store.head("proof.gateway-rollback-fence-v1"));
+});
+
+test("read-after-error recognizes an ambiguously successful control-state commit", async () => {
+  const store = new AmbiguousControlStateStore();
+  const { request } = fixture(store);
+  const objectId = "proof.ambiguous-control-write";
+  const bytes = Buffer.from("committed despite a lost PUT response");
+  const version = `sha256:${digest(bytes)}`;
+  store.storeThenThrowNextControlWrite = true;
+  let call = await request("OBJECT_PUT", bytes, { providerObjectId: objectId });
+  assert.equal(call.result.statusCode, 201);
+  assert.deepEqual(Buffer.from((await store.get(objectId)).body), bytes);
+  await assert.rejects(() => store.head("proof.gateway-rollback-fence-v1"));
+
+  store.storeThenThrowNextControlWrite = true;
+  call = await request(
+    "OBJECT_DELETE",
+    JSON.stringify({
+      deletionMode: "PERMANENT",
+      reason: "ambiguous commit proof",
+    }),
+    { providerObjectId: objectId, immutableProviderVersion: version },
+  );
+  assert.equal(call.result.statusCode, 204);
+  await assert.rejects(() => store.head(objectId));
+  const outbox = JSON.parse((await request("OUTBOX_LIST")).result.body).changes;
+  assert.deepEqual(
+    outbox
+      .filter((change) => change.objectId === objectId)
+      .map((change) => change.type),
+    ["PUT", "DELETED"],
+  );
+});
+
+test("archive and restore require an exact existing version and durable archive state", async () => {
+  const { config, request } = fixture();
+  const objectId = "proof.archive-state";
+  const bytes = Buffer.from("archive proof");
+  const version = `sha256:${digest(bytes)}`;
+  let call = await request(
+    "OBJECT_ARCHIVE",
+    JSON.stringify({ reason: "nonexistent proof" }),
+    { providerObjectId: objectId },
+  );
+  assert.equal(call.result.statusCode, 404);
+  call = await request("OBJECT_PUT", bytes, { providerObjectId: objectId });
+  assert.equal(call.result.statusCode, 201);
+  call = await request(
+    "OBJECT_RESTORE",
+    JSON.stringify({ reason: "not archived" }),
+    { providerObjectId: objectId, immutableProviderVersion: version },
+  );
+  assert.equal(call.result.statusCode, 409);
+  call = await request(
+    "OBJECT_ARCHIVE",
+    JSON.stringify({ reason: "retention proof" }),
+    { providerObjectId: objectId, immutableProviderVersion: version },
+  );
+  assert.equal(call.result.statusCode, 200);
+  const replacement = createGateway(config);
+  call = await request(
+    "OBJECT_RESTORE",
+    JSON.stringify({ reason: "retention complete" }),
+    { providerObjectId: objectId, immutableProviderVersion: version },
+    replacement,
+  );
+  assert.equal(call.result.statusCode, 200);
+  call = await request(
+    "OBJECT_RESTORE",
+    JSON.stringify({ reason: "cannot restore twice" }),
+    { providerObjectId: objectId, immutableProviderVersion: version },
+    replacement,
+  );
+  assert.equal(call.result.statusCode, 409);
+});
+
+test("usage paginates through every synthetic object", async () => {
+  const { request } = fixture();
+  for (let index = 0; index < 101; index += 1) {
+    const call = await request("OBJECT_PUT", Buffer.from("x"), {
+      providerObjectId: `proof.usage-${String(index).padStart(3, "0")}`,
+      requestSimplyId: `RQST-${String(index).padStart(4, "0")}-0002`,
+    });
+    assert.equal(call.result.statusCode, 201);
+  }
+  const call = await request("USAGE_GET");
+  assert.deepEqual(JSON.parse(call.result.body), {
+    objectCount: 101,
+    sizeBytes: 101,
+  });
+});
+
+test("inventory scans past internal control objects before returning a page", async () => {
+  const { request } = fixture();
+  const objectId = "proof.z-visible";
+  let call = await request("OBJECT_PUT", Buffer.from("visible"), {
+    providerObjectId: objectId,
+  });
+  assert.equal(call.result.statusCode, 201);
+
+  call = await request(
+    "INVENTORY_LIST",
+    JSON.stringify({ afterProviderObjectId: null, limit: 1 }),
+  );
+  assert.equal(call.result.statusCode, 200);
+  assert.deepEqual(JSON.parse(call.result.body).objectIds, [objectId]);
 });
 
 test("freshness is rechecked after a request waits for the serialized execution slot", async () => {
@@ -548,7 +778,7 @@ test("synthetic object lifecycle proves upload, immutable digest, migration veri
   assert.equal(
     call.result.statusCode,
     200,
-    "migration source is never deleted by migration",
+    "completed soak retires migration details without authorizing source deletion",
   );
 });
 
@@ -627,7 +857,7 @@ test("retry after an injected post-write failure emits the PUT event exactly onc
   assert.equal(call.result.statusCode, 200);
 
   call = await request("OBJECT_PUT", bytes, { providerObjectId: objectId });
-  assert.equal(call.result.statusCode, 200);
+  assert.equal(call.result.statusCode, 201);
   call = await request("OBJECT_PUT", bytes, { providerObjectId: objectId });
   assert.equal(call.result.statusCode, 200);
   const outbox = await request("OUTBOX_LIST");
@@ -656,7 +886,10 @@ test("full outbox applies backpressure before storage mutation and advances only
   assert.equal(JSON.parse(call.result.body).code, "OUTBOX_BACKPRESSURE");
   await assert.rejects(() => store.head("proof.outbox-backpressure"));
 
-  call = await request("OUTBOX_ACK", JSON.stringify({ throughSequence: 1_001 }));
+  call = await request(
+    "OUTBOX_ACK",
+    JSON.stringify({ throughSequence: 1_001 }),
+  );
   assert.equal(call.result.statusCode, 409);
   call = await request("OUTBOX_ACK", JSON.stringify({ throughSequence: 1 }));
   assert.equal(call.result.statusCode, 200);
