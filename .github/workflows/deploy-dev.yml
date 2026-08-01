@@ -1,0 +1,74 @@
+name: deploy-dev
+
+on:
+  workflow_dispatch:
+    inputs:
+      gateway_image:
+        description: Immutable gateway image URI pinned as image@sha256:<64 lowercase hex>
+        required: true
+        type: string
+      minio_image:
+        description: Immutable MinIO image URI pinned as image@sha256:<64 lowercase hex>
+        required: true
+        type: string
+      vpc_id:
+        required: true
+        type: string
+      public_subnet_ids:
+        description: Comma-separated public subnet IDs
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Configure repository-scoped AWS OIDC credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b69b9f7d8e4e521a # v4.3.1
+        with:
+          role-to-assume: ${{ vars.REFERENCE_FILE_PROVIDER_DEV_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Validate template
+        run: |
+          aws cloudformation validate-template --template-body file://infra/reference-file-provider-dev-bootstrap.yaml
+          aws cloudformation validate-template --template-body file://infra/reference-file-provider-dev.yaml
+      - name: Require digest-pinned images
+        env:
+          GATEWAY_IMAGE: ${{ inputs.gateway_image }}
+          MINIO_IMAGE: ${{ inputs.minio_image }}
+        run: |
+          pattern='^.+@sha256:[a-f0-9]{64}$'
+          [[ "$GATEWAY_IMAGE" =~ $pattern ]]
+          [[ "$MINIO_IMAGE" =~ $pattern ]]
+      - name: Deploy stack with desired count zero
+        env:
+          GATEWAY_IMAGE: ${{ inputs.gateway_image }}
+          MINIO_IMAGE: ${{ inputs.minio_image }}
+          PUBLIC_SUBNET_IDS: ${{ inputs.public_subnet_ids }}
+          VPC_ID: ${{ inputs.vpc_id }}
+        run: |
+          account_id="$(aws sts get-caller-identity --query Account --output text)"
+          if aws cloudformation describe-stacks --stack-name Simply360ReferenceFileProviderDev >/dev/null 2>&1; then
+            cluster="$(aws cloudformation describe-stacks --stack-name Simply360ReferenceFileProviderDev --query "Stacks[0].Outputs[?OutputKey=='Cluster'].OutputValue | [0]" --output text)"
+            service="$(aws cloudformation describe-stacks --stack-name Simply360ReferenceFileProviderDev --query "Stacks[0].Outputs[?OutputKey=='ServiceName'].OutputValue | [0]" --output text)"
+            service_state="$(aws ecs describe-services --cluster "$cluster" --services "$service" --query 'services[0].[desiredCount,runningCount,length(deployments),deployments[0].rolloutState]' --output text)"
+            if [ "$service_state" != $'0\t0\t1\tCOMPLETED' ]; then
+              echo "Refusing to deploy during or immediately after an acceptance run (got: $service_state)." >&2
+              exit 1
+            fi
+          fi
+          aws cloudformation deploy \
+            --stack-name Simply360ReferenceFileProviderDev \
+            --template-file infra/reference-file-provider-dev.yaml \
+            --role-arn "arn:aws:iam::${account_id}:role/Simply360ReferenceFileProviderDevCloudFormation" \
+            --parameter-overrides \
+              "VpcId=$VPC_ID" \
+              "PublicSubnetIds=$PUBLIC_SUBNET_IDS" \
+              "GatewayImage=$GATEWAY_IMAGE" \
+              "MinioImage=$MINIO_IMAGE"
