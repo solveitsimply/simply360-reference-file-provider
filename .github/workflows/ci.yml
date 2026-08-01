@@ -38,3 +38,6 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: MinIO adapter integration proof
+        run: npm run test:minio
