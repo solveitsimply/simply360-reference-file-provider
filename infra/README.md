@@ -7,13 +7,23 @@ later provisioning steps owned and rotated by the platform owner.
 ## GitHub OIDC deploy role
 
 Deployments use short-lived credentials via GitHub OIDC — no long-lived AWS
-keys. The IAM role trust must be scoped to **this repository and the `dev`
-branch only**:
+keys. The IAM role trust must be scoped to **this exact repository and the
+protected `dev` environment only**:
 
 - Repository: `solveitsimply/simply360-reference-file-provider`
-- Trusted subject: `repo:solveitsimply/simply360-reference-file-provider:ref:refs/heads/dev`
+  (organization ID `67548625`, repository ID `1305919089`)
+- Trusted subject:
+  `repo:solveitsimply@67548625/simply360-reference-file-provider@1305919089:environment:dev`
 - OIDC provider: `token.actions.githubusercontent.com` (the org's existing
   provider is reused)
+
+The subject uses GitHub's **immutable numeric IDs**, not the mutable
+`owner/name` pair. A name-scoped subject binds this role to a string: if the
+repository is deleted or renamed, whoever next creates that name inherits the
+trust. GitHub never reuses the numeric IDs, so this form cannot be squatted.
+Scoping to `environment:dev` rather than `ref:refs/heads/dev` also routes every
+deployment through the protected `dev` environment instead of any ref that
+happens to carry that name.
 
 > Creating or promoting a `main` branch — and any `main`-scoped trust — is
 > reserved for the Production/GA plan under fresh explicit authorization.
@@ -30,7 +40,7 @@ already be assumed to deploy it. The OIDC trust uses this exact
 ```json
 {
   "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-  "token.actions.githubusercontent.com:sub": "repo:solveitsimply/simply360-reference-file-provider:ref:refs/heads/dev"
+  "token.actions.githubusercontent.com:sub": "repo:solveitsimply@67548625/simply360-reference-file-provider@1305919089:environment:dev"
 }
 ```
 

@@ -17,7 +17,16 @@ Resources:
             Condition:
               StringEquals:
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: repo:solveitsimply/simply360-reference-file-provider:ref:refs/heads/dev
+                # Immutable-ID subject. `solveitsimply@67548625` and
+                # `simply360-reference-file-provider@1305919089` are the numeric
+                # organization and repository IDs, which GitHub never reuses.
+                # The name-only form (`repo:solveitsimply/simply360-reference-file-provider:...`)
+                # binds this role to a NAME: deleting or renaming the repository
+                # would let anyone who recreates that name inherit this trust.
+                # `environment:dev` additionally forces the job through the
+                # protected `dev` environment rather than any ref that happens
+                # to be called `dev`.
+                token.actions.githubusercontent.com:sub: repo:solveitsimply@67548625/simply360-reference-file-provider@1305919089:environment:dev
       Policies:
         - PolicyName: DeployExactDevStack
           PolicyDocument:

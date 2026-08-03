@@ -27,6 +27,11 @@ jobs:
   deploy:
     if: github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
+    # Required, not cosmetic: the bootstrap role trusts the subject
+    # `...:environment:dev`. GitHub only mints that subject for a job that
+    # declares this environment, so removing it makes every deploy fail closed
+    # at AssumeRoleWithWebIdentity rather than silently widening trust.
+    environment: dev
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: Configure repository-scoped AWS OIDC credentials

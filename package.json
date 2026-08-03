@@ -13,7 +13,8 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "test:minio": "npm run build && node scripts/run-minio-proof.mjs",
-    "test": "npm run build && node --test test/*.test.js"
+    "test": "npm run check:oidc-trust && npm run build && node --test test/*.test.js",
+    "check:oidc-trust": "node scripts/check-oidc-trust-boundary.mjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.1",
