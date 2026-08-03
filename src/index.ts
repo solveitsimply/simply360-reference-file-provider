@@ -18,6 +18,7 @@ import {
 } from "node:crypto";
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
+import { pathToFileURL } from "node:url";
 
 export const PROTOCOL_OPERATIONS = [
   "HEALTH",
@@ -304,9 +305,10 @@ export class MinioObjectStore implements ObjectStore {
         await new Promise((resolve) => setTimeout(resolve, 250));
       }
     }
-    throw new Error("MinIO sidecar did not become ready within 30 seconds", {
-      cause: lastError,
-    });
+    throw new Error(
+      `MinIO sidecar did not become ready within ${Math.round(maximumWaitMs / 1000)} seconds`,
+      { cause: lastError },
+    );
   }
   async get(objectId: string): Promise<StoredObject> {
     const response = await this.request("GET", objectId);
@@ -2323,7 +2325,12 @@ const writeHttp = (response: ServerResponse, result: GatewayResponse): void => {
   response.end(result.body);
 };
 
-if (process.argv[1] && new URL(import.meta.url).pathname === process.argv[1]) {
+// Compare file URLs, not paths. `new URL(import.meta.url).pathname` keeps
+// percent-encoding while `process.argv[1]` is raw, so a path containing a space
+// (or any character needing encoding) made the two differ and turned this
+// process into a silent no-op that exited 0 without ever starting the gateway.
+// `pathToFileURL` encodes argv[1] the same way, so the comparison holds.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const config = createGatewayFromEnvironment();
   await bootstrapGatewayStorage(config);
   startGateway(config);
