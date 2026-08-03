@@ -1,22 +1,56 @@
-# Infrastructure — intended provisioning (placeholder)
+# Infrastructure — deployable NonProd template
 
 This document records the **intended** AWS/GitHub OIDC provisioning for this
-reference proof. **No AWS resources are created by this repository.** Everything
-below is a later provisioning step, owned and rotated by the platform owner.
+reference proof. **Nothing deploys automatically.** Both templates are explicit
+later provisioning steps owned and rotated by the platform owner.
 
 ## GitHub OIDC deploy role
 
 Deployments use short-lived credentials via GitHub OIDC — no long-lived AWS
-keys. The IAM role trust must be scoped to **this repository and the `dev`
-branch only**:
+keys. The IAM role trust must be scoped to **this exact repository and the
+protected `dev` environment only**:
 
 - Repository: `solveitsimply/simply360-reference-file-provider`
-- Trusted subject: `repo:solveitsimply/simply360-reference-file-provider:ref:refs/heads/dev`
+  (organization ID `67548625`, repository ID `1305919089`)
+- Trusted subject:
+  `repo:solveitsimply@67548625/simply360-reference-file-provider@1305919089:environment:dev`
 - OIDC provider: `token.actions.githubusercontent.com` (the org's existing
   provider is reused)
 
+The subject uses GitHub's **immutable numeric IDs**, not the mutable
+`owner/name` pair. A name-scoped subject binds this role to a string: if the
+repository is deleted or renamed, whoever next creates that name inherits the
+trust. GitHub never reuses the numeric IDs, so this form cannot be squatted.
+Scoping to `environment:dev` rather than `ref:refs/heads/dev` also routes every
+deployment through the protected `dev` environment instead of any ref that
+happens to carry that name.
+
 > Creating or promoting a `main` branch — and any `main`-scoped trust — is
 > reserved for the Production/GA plan under fresh explicit authorization.
+
+The GitHub deployment role, CloudFormation service role, ECS task execution
+role, and cleanup-Lambda role are **bootstrap prerequisites** created once by
+the platform owner from the separately validated
+`reference-file-provider-dev-bootstrap.yaml` template. That template accepts
+no repository, branch, role-name, OIDC-provider, or secret parameters. The
+application stack deliberately does not try to create the role that must
+already be assumed to deploy it. The OIDC trust uses this exact
+`StringEquals` subject (not a parameter or wildcard):
+
+```json
+{
+  "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+  "token.actions.githubusercontent.com:sub": "repo:solveitsimply@67548625/simply360-reference-file-provider@1305919089:environment:dev"
+}
+```
+
+The GitHub role needs only CloudFormation change-set/deploy/read actions for
+this stack plus `iam:PassRole` for the fixed CloudFormation service role. The
+CloudFormation service role owns the ECS, API Gateway, Cloud Map, EventBridge,
+Lambda, logs, security-group, deterministic empty runtime-secret container,
+and exact pass-role authority. The task role reads only that named secret; the
+cleanup role can only update the deterministically named ECS service and write
+its bounded log stream.
 
 ## NonProd stack and region
 
@@ -45,6 +79,11 @@ The file-provider stack exposes **only an API Gateway HTTPS origin**:
   runtime**, with scheduled/CI cleanup.
 - Provider state is **disposable synthetic proof objects** and never customer
   data.
+- ECS deployment configuration is fixed at maximum 100% / minimum 0%, so an
+  update cannot add a second task. The acceptance launcher additionally
+  refuses to start unless the service is idle with one completed deployment;
+  the deploy workflow enforces the same idle-state precondition, so stack and
+  service updates are rejected during the acceptance window.
 
 ## Cost guardrail
 
@@ -56,6 +95,14 @@ the cap.
 ## What is NOT here
 
 No credentials, secret values, SSM references, or Simply360 internal
-configuration are stored in this repository (Ratified Direction 9 / 21). No
-CloudFormation/CDK/Terraform templates are provisioned; this file is
-documentation of the later provisioning step only.
+configuration are stored in this repository (Ratified Direction 9 / 21).
+
+`reference-file-provider-dev.yaml` is a manually triggered dev template; its
+ECS service starts at desired count `0` and creates the empty, deterministic
+`simply360/reference-file-provider/dev/runtime` secret container. The owner
+writes its six values out of band after deployment. The `deploy-dev` workflow
+takes only existing VPC/public-subnet and digest-pinned image inputs through
+repo/branch-scoped OIDC and never runs automatically. For an owner-approved
+synthetic acceptance window, `run-acceptance-window.sh` starts exactly one task
+and its exit trap restores desired count `0`. No local or CI command deploys
+this stack.

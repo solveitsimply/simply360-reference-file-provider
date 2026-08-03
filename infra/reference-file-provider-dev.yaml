@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NonProd-only Simply360 reference primary-file-provider gateway. API Gateway HTTP API is the only public origin;
+  VPC Link reaches Cloud Map/ECS, while MinIO is task-local. Desired count remains zero until an approved acceptance run.
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  GatewayImage:
+    Type: String
+    AllowedPattern: '^.+@sha256:[a-f0-9]{64}$'
+  MinioImage:
+    Type: String
+    AllowedPattern: '^.+@sha256:[a-f0-9]{64}$'
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: simply360-reference-file-provider-dev
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/ecs/simply360-reference-file-provider-dev
+      RetentionInDays: 7
+  CleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/Simply360ReferenceFileProviderDevCleanup
+      RetentionInDays: 7
+  RuntimeSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: simply360/reference-file-provider/dev/runtime
+      Description: Empty repository-scoped container; the owner writes runtime values out of band.
+  GatewaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Only API Gateway VPC Link reaches the gateway port; MinIO has no public rule.
+      VpcId: !Ref VpcId
+  VpcLinkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: API Gateway VPC Link egress only.
+      VpcId: !Ref VpcId
+  GatewayIngressFromVpcLink:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref GatewaySecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref VpcLinkSecurityGroup
+  Namespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: reference-file-provider.dev.internal
+      Vpc: !Ref VpcId
+  GatewayServiceDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: gateway
+      NamespaceId: !Ref Namespace
+      DnsConfig:
+        DnsRecords: [{ Type: A, TTL: 10 }]
+        RoutingPolicy: MULTIVALUE
+  VpcLink:
+    Type: AWS::ApiGatewayV2::VpcLink
+    Properties:
+      Name: Simply360ReferenceFileProviderDev
+      SubnetIds: !Ref PublicSubnetIds
+      SecurityGroupIds: [!Ref VpcLinkSecurityGroup]
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: Simply360ReferenceFileProviderDev
+      ProtocolType: HTTP
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      ConnectionId: !Ref VpcLink
+      ConnectionType: VPC_LINK
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:servicediscovery:service/${GatewayServiceDiscovery}'
+      PayloadFormatVersion: '1.0'
+  Route:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: '$default'
+      Target: !Join ['/', ['integrations', !Ref Integration]]
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/Simply360ReferenceFileProviderDevTaskExecution'
+      EphemeralStorage: { SizeInGiB: 20 }
+      ContainerDefinitions:
+        - Name: gateway
+          Image: !Ref GatewayImage
+          Essential: true
+          PortMappings: [{ ContainerPort: 8080 }]
+          Secrets:
+            - Name: S360_PLATFORM_KEY_ID
+              ValueFrom: !Sub '${RuntimeSecret}:S360_PLATFORM_KEY_ID::'
+            - Name: S360_PLATFORM_PUBLIC_KEY_PEM
+              ValueFrom: !Sub '${RuntimeSecret}:S360_PLATFORM_PUBLIC_KEY_PEM::'
+            - Name: S360_PROVIDER_KEY_ID
+              ValueFrom: !Sub '${RuntimeSecret}:S360_PROVIDER_KEY_ID::'
+            - Name: S360_PROVIDER_PRIVATE_KEY_PEM
+              ValueFrom: !Sub '${RuntimeSecret}:S360_PROVIDER_PRIVATE_KEY_PEM::'
+            - Name: MINIO_ACCESS_KEY
+              ValueFrom: !Sub '${RuntimeSecret}:MINIO_ACCESS_KEY::'
+            - Name: MINIO_SECRET_KEY
+              ValueFrom: !Sub '${RuntimeSecret}:MINIO_SECRET_KEY::'
+          Environment:
+            - { Name: MINIO_ENDPOINT, Value: http://127.0.0.1:9000 }
+            - { Name: MINIO_BUCKET, Value: simply360-reference-proof }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref LogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: gateway }
+        - Name: minio
+          Image: !Ref MinioImage
+          Essential: true
+          Command: ['server', '/data']
+          PortMappings: [{ ContainerPort: 9000 }]
+          Secrets:
+            - Name: MINIO_ROOT_USER
+              ValueFrom: !Sub '${RuntimeSecret}:MINIO_ACCESS_KEY::'
+            - Name: MINIO_ROOT_PASSWORD
+              ValueFrom: !Sub '${RuntimeSecret}:MINIO_SECRET_KEY::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options: { awslogs-group: !Ref LogGroup, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: minio }
+  Service:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref Cluster
+      ServiceName: simply360-reference-file-provider-dev
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 0
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+      EnableExecuteCommand: false
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups: [!Ref GatewaySecurityGroup]
+      ServiceRegistries: [{ RegistryArn: !GetAtt GatewayServiceDiscovery.Arn }]
+  CleanupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: CleanupLogGroup
+    Properties:
+      FunctionName: Simply360ReferenceFileProviderDevCleanup
+      Runtime: nodejs22.x
+      Handler: index.handler
+      Role: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:role/Simply360ReferenceFileProviderDevCleanup'
+      Timeout: 30
+      Environment:
+        Variables:
+          CLUSTER: !Ref Cluster
+          SERVICE: !GetAtt Service.Name
+      Code:
+        ZipFile: |
+          const { ECSClient, UpdateServiceCommand } = require('@aws-sdk/client-ecs');
+          exports.handler = async () => new ECSClient().send(new UpdateServiceCommand({ cluster: process.env.CLUSTER, service: process.env.SERVICE, desiredCount: 0 }));
+  CleanupPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CleanupFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CleanupRule.Arn
+  CleanupRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Independent four-hour safety cleanup; resets the acceptance service to desired count zero.
+      ScheduleExpression: rate(4 hours)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt CleanupFunction.Arn
+          Id: reset-desired-count-zero
+Outputs:
+  PublicOrigin:
+    Value: !GetAtt HttpApi.ApiEndpoint
+  Cluster:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  RuntimeSecretArn:
+    Value: !Ref RuntimeSecret

@@ -30,6 +30,9 @@ jobs:
       - name: Install
         run: npm ci --no-audit --no-fund
 
+      - name: OIDC trust boundary
+        run: npm run check:oidc-trust
+
       - name: Type-check
         run: npm run type-check
 
@@ -38,3 +41,6 @@ jobs:
 
       - name: Test
         run: npm test
+
+      - name: MinIO adapter integration proof
+        run: npm run test:minio
