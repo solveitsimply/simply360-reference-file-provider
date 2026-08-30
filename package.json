@@ -17,7 +17,7 @@
     "check:oidc-trust": "node scripts/check-oidc-trust-boundary.mjs"
   },
   "devDependencies": {
-    "@types/node": "^22.10.1",
+    "@types/node": "^26.4.0",
     "typescript": "~5.7.2"
   }
 }
